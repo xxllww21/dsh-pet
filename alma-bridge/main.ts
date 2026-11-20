@@ -34,9 +34,29 @@ const FETCH_TIMEOUT_MS = 5_000;
 const PROBE_TIMEOUT_MS = 1_200;
 const RESOLVE_TTL_MS = 60_000;
 
+/** Alma 会在用户消息里塞 [Context: …] / [Message sent-at: …] 这类元信息，气泡里不该出现。 */
+const LEADING_META = [
+    /^\s*\[Context:[\s\S]*?\]\s*/,
+    /^\s*\[Message sent-at:[\s\S]*?\]\s*/,
+    /^\s*\[Attachment[\s\S]*?\]\s*/,
+    /^\s*<reminder>[\s\S]*?<\/reminder>\s*/i,
+    /^\s*<context>[\s\S]*?<\/context>\s*/i,
+];
+
+/** 去掉开头的元信息块，压平空白，只留用户真正说的话。 */
+function cleanTask(text: string): string {
+    let out = text;
+    for (let round = 0; round < 8; round += 1) {
+        const before = out;
+        for (const pattern of LEADING_META) out = out.replace(pattern, '');
+        if (out === before) break;
+    }
+    return out.replace(/\s+/g, ' ').trim();
+}
+
 /** 截成最多 40 个码点（宠物 work-status 的 task 上限）。 */
 function truncateTask(text: string): string {
-    const points = Array.from(text.trim());
+    const points = Array.from(cleanTask(text));
     return points.length > 40 ? points.slice(0, 40).join('') : points.join('');
 }
 
