@@ -1,25 +1,38 @@
 /**
- * dsh-pet × Alma 桥接插件（草稿 v0.1，未实测）。
+ * dsh-pet × Alma 桥接插件 v0.2。
  *
- * 作用：订阅 Alma 的 agent 事件，把任务状态推给独立运行的 dsh-pet
- * （独立模式在本机 3080 端口提供 /dsh-pet-7340 HTTP 接口）。
+ * 作用：订阅 Alma 的 agent 事件，把任务状态推给正在跑的 dsh-pet
+ * （宠物宿主在 /dsh-pet-7340 前缀下提供 HTTP 接口）。
  *
  * 状态映射（Alma hooks → 宠物 work-status 档位）：
  * - chat.message.willSend / tool.willExecute → working（工作中）
- * - chat.message.didReceive                     → success（完成，12 秒后回空闲）
- * - tool.onError                                → error（出错，12 秒后回空闲）
- * - 长时间无活动 / app.willQuit / 插件停用       → DELETE /work-status（回空闲）
+ * - chat.message.didReceive                   → success（完成，12 秒后回空闲）
+ * - tool.onError                              → error（出错，12 秒后回空闲）
+ * - 长时间无活动 / app.willQuit / 插件停用     → DELETE /work-status（回空闲）
+ *
+ * 端口自动发现（v0.2 新增）：
+ * - DSH 桌面版每次启动的 web 端口是随机的，独立模式（dsh-pet.exe）也是随机端口，
+ *   所以写死 3080 基本连不上。这里按顺序找：
+ *     1. 设置里显式配的 petBaseUrl
+ *     2. ~/.dsh/dsh-pet/logs.txt 里最近出现过的 http://127.0.0.1:<port>/dsh-pet-<n>
+ *     3. 兜底：扫本机端口（常见端口 + 49152-65535 临时端口段）
+ *   探到能回 200 的地址就缓存 60 秒，一次失败会作废重找。
  *
  * 只用不需占用锁的端点：POST/DELETE /work-status；celebrateAnim 配了才调 POST /anim。
- * 聊天本身不走这里：宠物对话直接配它自己的 AI 设置（custom 服务商 + 用户 API + deepseek v4.1 flash）。
  */
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import type { PluginContext, PluginActivation } from 'alma-plugin-api';
 
 type PetWorkState = 'thinking' | 'working' | 'result' | 'waiting' | 'success' | 'error';
 
 const DEFAULT_BASE_URL = 'http://127.0.0.1:3080';
+const PET_PREFIX = '/dsh-pet-7340';
 const IDLE_DELAY_MS = 12_000;
 const FETCH_TIMEOUT_MS = 5_000;
+const PROBE_TIMEOUT_MS = 1_200;
+const RESOLVE_TTL_MS = 60_000;
 
 /** 截成最多 40 个码点（宠物 work-status 的 task 上限）。 */
 function truncateTask(text: string): string {
@@ -27,41 +40,152 @@ function truncateTask(text: string): string {
     return points.length > 40 ? points.slice(0, 40).join('') : points.join('');
 }
 
+/** 从宠物日志里翻最近的宿主地址（DSH 桌面版与独立模式都会写这一份）。 */
+function logCandidates(): string[] {
+    const homes = [process.env.DSH_HOME, join(homedir(), '.dsh')].filter(
+        (item): item is string => typeof item === 'string' && item.length > 0,
+    );
+    const out: string[] = [];
+    for (const home of homes) {
+        let text = '';
+        try {
+            text = readFileSync(join(home, 'dsh-pet', 'logs.txt'), 'utf8');
+        } catch {
+            continue;
+        }
+        const matches = [...text.matchAll(/http:\/\/127\.0\.0\.1:(\d+)\/dsh-pet-\d+/g)];
+        for (let i = matches.length - 1; i >= 0 && out.length < 8; i -= 1) {
+            const base = 'http://127.0.0.1:' + matches[i][1];
+            if (!out.includes(base)) out.push(base);
+        }
+    }
+    return out;
+}
+
+/** 兜底扫描用的端口清单：常见端口在前，然后是本机临时端口段。 */
+function scanPorts(): number[] {
+    const ports = [3080, 3081, 3082, 8080, 3000, 5173];
+    for (let port = 49152; port <= 65535; port += 1) ports.push(port);
+    return ports;
+}
+
+async function probe(base: string): Promise<boolean> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+    try {
+        const res = await fetch(base + PET_PREFIX + '/state', { signal: controller.signal });
+        if (!res.ok) return false;
+        const body = (await res.json()) as { sections?: unknown };
+        return typeof body === 'object' && body !== null && 'sections' in body;
+    } catch {
+        return false;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/** 并发探一批端口，返回第一个能连上的地址。 */
+async function scanForPet(): Promise<string | undefined> {
+    const ports = scanPorts();
+    const batchSize = 256;
+    for (let start = 0; start < ports.length; start += batchSize) {
+        const batch = ports.slice(start, start + batchSize);
+        const hits = await Promise.all(
+            batch.map(async (port) => {
+                const base = 'http://127.0.0.1:' + port;
+                return (await probe(base)) ? base : undefined;
+            }),
+        );
+        const hit = hits.find((item) => item !== undefined);
+        if (hit) return hit;
+    }
+    return undefined;
+}
+
 export async function activate(context: PluginContext): Promise<PluginActivation> {
     const { logger, events, settings, ui } = context;
 
-    const baseUrl = () => settings.get<string>('dshPetAlmaBridge.petBaseUrl', DEFAULT_BASE_URL);
-    const celebrateAnim = () =>
-        settings.get<string>('dshPetAlmaBridge.celebrateAnim', '');
+    const configuredUrl = () => settings.get<string>('dshPetAlmaBridge.petBaseUrl', DEFAULT_BASE_URL);
+    const celebrateAnim = () => settings.get<string>('dshPetAlmaBridge.celebrateAnim', '');
     const enabled = () => settings.get<boolean>('dshPetAlmaBridge.enabled', true);
+    const autoDiscover = () => settings.get<boolean>('dshPetAlmaBridge.autoDiscover', true);
 
     const statusBar = ui.createStatusBarItem({ id: 'dsh-pet-alma-bridge', alignment: 'left' });
     statusBar.text = '小肥鱼：空闲';
     statusBar.show();
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
-    let petReachable = false;
+    let cachedBase: string | undefined;
+    let cachedAt = 0;
+    let resolving: Promise<string | undefined> | undefined;
 
     function setStatusBar(text: string): void {
         statusBar.text = text;
     }
 
+    function remember(base: string): string {
+        cachedBase = base;
+        cachedAt = Date.now();
+        return base;
+    }
+
+    function forgetBase(): void {
+        cachedBase = undefined;
+        cachedAt = 0;
+    }
+
+    /** 找到能用（GET /state 回 200）的宠物地址；结果缓存 60 秒。 */
+    async function resolveBase(force = false): Promise<string | undefined> {
+        if (!force && cachedBase && Date.now() - cachedAt < RESOLVE_TTL_MS) return cachedBase;
+        if (resolving) return resolving;
+        resolving = (async () => {
+            const configured = configuredUrl().trim();
+            if (configured.length > 0 && (await probe(configured))) return remember(configured);
+            if (!autoDiscover()) return undefined;
+            for (const base of logCandidates()) {
+                if (base === configured) continue;
+                if (await probe(base)) {
+                    logger.info('从宠物日志找到宿主：' + base);
+                    return remember(base);
+                }
+            }
+            const scanned = await scanForPet();
+            if (scanned) {
+                logger.info('扫描找到宠物宿主：' + scanned);
+                return remember(scanned);
+            }
+            return undefined;
+        })();
+        try {
+            return await resolving;
+        } finally {
+            resolving = undefined;
+        }
+    }
+
     async function postJson(path: string, init: RequestInit): Promise<boolean> {
+        const base = await resolveBase();
+        if (!base) {
+            setStatusBar('小肥鱼：未连接');
+            return false;
+        }
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
         try {
-            const res = await fetch(`${baseUrl()}${path}`, {
+            const res = await fetch(base + path, {
                 ...init,
                 signal: controller.signal,
             });
             if (!res.ok) {
-                logger.warn(`宠物接口 ${path} 返回 HTTP ${res.status}`);
+                logger.warn('宠物接口 ' + path + ' 返回 HTTP ' + res.status);
+                forgetBase();
                 return false;
             }
             return true;
         } catch (error) {
             logger.warn(
-                `连不上宠物（${baseUrl()}）：${error instanceof Error ? error.message : String(error)}`,
+                '连不上宠物（' + base + '）：' + (error instanceof Error ? error.message : String(error)),
             );
+            forgetBase();
             return false;
         } finally {
             clearTimeout(timer);
@@ -71,25 +195,24 @@ export async function activate(context: PluginContext): Promise<PluginActivation
     async function setWorkStatus(state: PetWorkState, task?: string | null): Promise<void> {
         const body: Record<string, unknown> = { state };
         if (task !== undefined) body.task = task;
-        const ok = await postJson('/dsh-pet-7340/work-status', {
+        const ok = await postJson(PET_PREFIX + '/work-status', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify(body),
         });
-        petReachable = ok;
-        setStatusBar(ok ? `小肥鱼：${stateLabel(state)}` : '小肥鱼：未连接');
+        setStatusBar(ok ? '小肥鱼：' + stateLabel(state) : '小肥鱼：未连接');
     }
 
     async function clearWorkStatus(): Promise<void> {
-        await postJson('/dsh-pet-7340/work-status', { method: 'DELETE' });
-        setStatusBar('小肥鱼：空闲');
+        const ok = await postJson(PET_PREFIX + '/work-status', { method: 'DELETE' });
+        setStatusBar(ok ? '小肥鱼：空闲' : '小肥鱼：未连接');
     }
 
     function scheduleIdle(): void {
         clearTimeout(idleTimer);
         idleTimer = setTimeout(() => {
             void clearWorkStatus().catch((error: unknown) => {
-                logger.warn(`回空闲失败：${error instanceof Error ? error.message : String(error)}`);
+                logger.warn('回空闲失败：' + (error instanceof Error ? error.message : String(error)));
             });
         }, IDLE_DELAY_MS);
     }
@@ -103,7 +226,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         const name = celebrateAnim();
         if (!name) return;
         const petId = settings.get<string>('dshPetAlmaBridge.petId', 'main');
-        await postJson(`/dsh-pet-7340/anim?pet=${encodeURIComponent(petId)}`, {
+        await postJson(PET_PREFIX + '/anim?pet=' + encodeURIComponent(petId), {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ name }),
@@ -115,16 +238,16 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             if (!enabled()) return;
             cancelIdle();
             void setWorkStatus('working', truncateTask(input.content)).catch((error: unknown) => {
-                logger.warn(`推 working 失败：${String(error)}`);
+                logger.warn('推 working 失败：' + String(error));
             });
         }),
         events.on('tool.willExecute', (input) => {
             if (!enabled()) return;
             cancelIdle();
             void setWorkStatus('working').catch((error: unknown) => {
-                logger.warn(`推 working 失败：${String(error)}`);
+                logger.warn('推 working 失败：' + String(error));
             });
-            logger.debug(`工具开始：${input.tool}`);
+            logger.debug('工具开始：' + input.tool);
         }),
         events.on('tool.didExecute', () => {
             // 回合还没完，等 didReceive 再报完成；这里只续一下工作态。
@@ -136,29 +259,31 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             void setWorkStatus('success')
                 .then(() => playCelebrate())
                 .catch((error: unknown) => {
-                    logger.warn(`推 success 失败：${String(error)}`);
+                    logger.warn('推 success 失败：' + String(error));
                 });
             scheduleIdle();
         }),
         events.on('tool.onError', (input) => {
             if (!enabled()) return;
-            void setWorkStatus('error', truncateTask(`工具 ${input.tool} 出错`)).catch(
+            void setWorkStatus('error', truncateTask('工具 ' + input.tool + ' 出错')).catch(
                 (error: unknown) => {
-                    logger.warn(`推 error 失败：${String(error)}`);
+                    logger.warn('推 error 失败：' + String(error));
                 },
             );
             scheduleIdle();
         }),
         events.on('app.ready', () => {
-            logger.info('小肥鱼桥接已就绪，宠物接口：' + baseUrl());
-            void postJson('/dsh-pet-7340/state', { method: 'GET' }).then((ok) => {
-                petReachable = ok;
-                setStatusBar(ok ? '小肥鱼：空闲' : '小肥鱼：未连接');
-                if (!ok) {
+            logger.info('小肥鱼桥接已就绪，开始找宠物宿主…');
+            void resolveBase(true).then((base) => {
+                if (!base) {
+                    setStatusBar('小肥鱼：未连接');
                     logger.warn(
-                        '没连上宠物：请先启动独立模式（dsh-pet-standalone，默认端口 3080），再在插件设置里核对地址。',
+                        '没找到宠物：先让 DSH 桌面版（或 dsh-pet.exe）跑起来，再回插件设置点保存重连。',
                     );
+                    return;
                 }
+                setStatusBar('小肥鱼：空闲');
+                logger.info('宠物宿主：' + base);
             });
         }),
         events.on('app.willQuit', async () => {
@@ -167,12 +292,13 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         }),
         settings.onDidChange((event) => {
             if (event.key === 'dshPetAlmaBridge.petBaseUrl') {
-                logger.info(`宠物地址改成 ${String(event.newValue)}，下次事件起生效`);
+                forgetBase();
+                logger.info('宠物地址改成 ' + String(event.newValue) + '，下次事件起重新探测');
             }
         }),
     ];
 
-    logger.info('小肥鱼桥接插件已激活');
+    logger.info('小肥鱼桥接插件已激活（v0.2，支持端口自动发现）');
 
     return {
         dispose: async () => {
