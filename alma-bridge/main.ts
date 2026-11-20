@@ -34,24 +34,57 @@ const FETCH_TIMEOUT_MS = 5_000;
 const PROBE_TIMEOUT_MS = 1_200;
 const RESOLVE_TTL_MS = 60_000;
 
-/** Alma 会在用户消息里塞 [Context: …] / [Message sent-at: …] 这类元信息，气泡里不该出现。 */
-const LEADING_META = [
-    /^\s*\[Context:[\s\S]*?\]\s*/,
-    /^\s*\[Message sent-at:[\s\S]*?\]\s*/,
-    /^\s*\[Attachment[\s\S]*?\]\s*/,
-    /^\s*<reminder>[\s\S]*?<\/reminder>\s*/i,
-    /^\s*<context>[\s\S]*?<\/context>\s*/i,
-];
+/** Alma 会往用户消息里塞元信息块：[Context: …]、[Message sent-at: …]、[The user is replying to …] 等。 */
+const META_BLOCK_HEAD = /^\[(?:Context:|Message sent-at:|Attachment|The user is replying|Reminder|System|Voice)/i;
+const META_BLOCK_HINTS = /(?:sender local time|Quoted excerpt|message id|Authoritative Local DateTime|<reminder>)/i;
+
+/** 取从开头左括号到配对右括号的整块；括号不配对时返回 undefined。 */
+function leadingBracketBlock(text: string): { block: string; rest: string } | undefined {
+    if (!text.startsWith('[')) return undefined;
+    let depth = 0;
+    for (let i = 0; i < text.length; i += 1) {
+        const ch = text[i];
+        if (ch === '[') depth += 1;
+        else if (ch === ']') {
+            depth -= 1;
+            if (depth === 0) return { block: text.slice(0, i + 1), rest: text.slice(i + 1) };
+            if (depth < 0) return undefined;
+        }
+    }
+    return undefined;
+}
 
 /** 去掉开头的元信息块，压平空白，只留用户真正说的话。 */
 function cleanTask(text: string): string {
-    let out = text;
+    let out = text.replace(/^\s+/, '');
     for (let round = 0; round < 8; round += 1) {
-        const before = out;
-        for (const pattern of LEADING_META) out = out.replace(pattern, '');
-        if (out === before) break;
+        out = out.replace(/^<reminder>[\s\S]*?<\/reminder>\s*/i, '').replace(/^<context>[\s\S]*?<\/context>\s*/i, '').replace(/^\s+/, '');
+        const found = leadingBracketBlock(out);
+        if (!found) {
+            // 括号不配对（Alma 有时只给前半截）：只要开头是已知元信息，就按空行切掉这一段。
+            if (!META_BLOCK_HEAD.test(out)) break;
+            const cut = out.indexOf('\n\n');
+            out = cut < 0 ? '' : out.slice(cut + 2).replace(/^\s+/, '');
+            continue;
+        }
+        if (!META_BLOCK_HEAD.test(found.block) && !META_BLOCK_HINTS.test(found.block)) break;
+        out = found.rest.replace(/^\s+/, '');
     }
     return out.replace(/\s+/g, ' ').trim();
+}
+
+/** 清洗后还残留这些字样，说明元信息没剥干净，改用固定文案，绝不让英文漏进气泡。 */
+const META_LEAK =
+    /(?:Message sent-at|sender local time|The user is replying|Quoted excerpt|<reminder|<\/reminder>|Authoritative Local DateTime|EMOTION SYSTEM)/i;
+
+const FALLBACK_TASK = '在处理你的消息';
+
+/** 用户消息 → 气泡文案：清洗 → 残留检查 → 截 40 码点。 */
+function taskFromMessage(text: string): string {
+    const cleaned = cleanTask(text);
+    if (cleaned.length === 0 || META_LEAK.test(cleaned)) return FALLBACK_TASK;
+    const points = Array.from(cleaned);
+    return points.length > 40 ? points.slice(0, 40).join('') : points.join('');
 }
 
 /** 截成最多 40 个码点（宠物 work-status 的 task 上限）。 */
@@ -257,7 +290,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         events.on('chat.message.willSend', (input) => {
             if (!enabled()) return;
             cancelIdle();
-            void setWorkStatus('working', truncateTask(input.content)).catch((error: unknown) => {
+            void setWorkStatus('working', taskFromMessage(input.content)).catch((error: unknown) => {
                 logger.warn('推 working 失败：' + String(error));
             });
         }),
