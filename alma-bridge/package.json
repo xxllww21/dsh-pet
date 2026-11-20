@@ -1,6 +1,6 @@
 {
     "name": "dsh-pet-alma-bridge",
-    "version": "0.2.0",
+    "version": "0.2.1",
     "private": true,
     "type": "module",
     "description": "把 Alma 里 agent 的任务状态推给运行中的 dsh-pet 桌宠（支持端口自动发现）",
