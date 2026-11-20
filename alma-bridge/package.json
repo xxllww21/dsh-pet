@@ -1,1 +1,19 @@
-{"dependencies":{"alma-plugin-api":"^0.1.2"},"description":"把 Alma 里 agent 的任务状态推给独立运行的 dsh-pet 桌宠","devDependencies":{"typescript":"^5.6.0","zod":"^3.23.0"},"name":"dsh-pet-alma-bridge","private":true,"scripts":{"build":"tsc","check":"tsc --noEmit"},"type":"module","version":"0.1.0"}
+{
+    "name": "dsh-pet-alma-bridge",
+    "version": "0.2.0",
+    "private": true,
+    "type": "module",
+    "description": "把 Alma 里 agent 的任务状态推给运行中的 dsh-pet 桌宠（支持端口自动发现）",
+    "scripts": {
+        "build": "tsc",
+        "check": "tsc --noEmit"
+    },
+    "dependencies": {
+        "alma-plugin-api": "^0.1.2"
+    },
+    "devDependencies": {
+        "@types/node": "^24.0.0",
+        "typescript": "^5.6.0",
+        "zod": "^3.23.0"
+    }
+}
