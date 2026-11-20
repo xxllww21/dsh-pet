@@ -1,1 +1,49 @@
-{"activationEvents":["onStartup"],"author":{"name":"xxllww21"},"contributes":{"configuration":{"properties":{"dshPetAlmaBridge.celebrateAnim":{"default":"","description":"任务完成时点播的动画名（留空就不播；名字必须是宠物动画池里有的，如菜单里能点到的动作）","type":"string"},"dshPetAlmaBridge.enabled":{"default":true,"description":"是否把 Alma 任务状态推给桌宠","type":"boolean"},"dshPetAlmaBridge.petBaseUrl":{"default":"http://127.0.0.1:3080","description":"独立模式桌宠的地址（默认端口 3080；端口被占会自动顺延，启动时看它的输出）","type":"string"},"dshPetAlmaBridge.petId":{"default":"main","description":"桌宠 id（点播庆祝动画时用）","type":"string"}},"title":"小肥鱼桥接设置"}},"description":"Alma 里 agent 干活时，让桌上的小肥鱼跟着变状态：想、干活、完成、出错","engines":{"alma":"^0.1.0"},"id":"dsh-pet-alma-bridge","main":"main.js","name":"小肥鱼 × Alma 桥接","type":"composite","version":"0.1.0"}
+{
+    "activationEvents": [
+        "onStartup"
+    ],
+    "author": {
+        "name": "xxllww21"
+    },
+    "contributes": {
+        "configuration": {
+            "properties": {
+                "dshPetAlmaBridge.enabled": {
+                    "default": true,
+                    "description": "是否把 Alma 任务状态推给桌宠",
+                    "type": "boolean"
+                },
+                "dshPetAlmaBridge.petBaseUrl": {
+                    "default": "http://127.0.0.1:3080",
+                    "description": "桌宠宿主地址。连不上时会按下面的自动发现逻辑另找，所以留默认值即可",
+                    "type": "string"
+                },
+                "dshPetAlmaBridge.autoDiscover": {
+                    "default": true,
+                    "description": "宿主端口是随机的时候自动查找（先读宠物日志，再扫本机端口）",
+                    "type": "boolean"
+                },
+                "dshPetAlmaBridge.petId": {
+                    "default": "main",
+                    "description": "桌宠 id（点播庆祝动画时用）",
+                    "type": "string"
+                },
+                "dshPetAlmaBridge.celebrateAnim": {
+                    "default": "",
+                    "description": "任务完成时点播的动画名（留空就不播；名字必须是宠物动画池里有的）",
+                    "type": "string"
+                }
+            },
+            "title": "小肥鱼桥接设置"
+        }
+    },
+    "description": "Alma 里 agent 干活时，让桌上的小肥鱼跟着变状态：干活、完成、出错；自动找宠物端口",
+    "engines": {
+        "alma": "^0.1.0"
+    },
+    "id": "dsh-pet-alma-bridge",
+    "main": "main.js",
+    "name": "小肥鱼 × Alma 桥接",
+    "type": "composite",
+    "version": "0.2.0"
+}
